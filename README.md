@@ -7,6 +7,7 @@ NoTyping is a native macOS menu bar dictation app for system-wide AI voice typin
 - Provides a menu bar app with a global hotkey, optional toggle mode, floating HUD, settings, and permission troubleshooting.
 - Streams microphone audio incrementally to an OpenAI-compatible realtime transcription backend instead of uploading one long recording.
 - Applies deterministic vocabulary normalization before rewrite so terms like `NCCL`, `CUDA`, `PyTorch`, and `LLaMA` are preserved consistently.
+- Protects code-aware tokens such as flags, paths, URLs, acronyms, and identifier-like terms before rewrite in code and terminal contexts.
 - Supports app-specific rules that can override category, dictation profile, rewrite aggressiveness, or disable rewrite entirely for specific bundle identifiers.
 - Inserts the final text into the focused app using accessibility selected-text replacement first when possible, then full AX value replacement, then Unicode typing, then pasteboard fallback.
 - Supports Auto, English, and Simplified Chinese language modes and preserves the original language in the rewrite layer.
@@ -32,7 +33,7 @@ More detail lives in [Docs/Architecture.md](/Users/baodi/Documents/GitHub.nosync
 4. The realtime service streams chunks over WebSocket and receives partial and finalized transcript events.
 5. `TranscriptAssembler` stabilizes partials and emits finalized segments in order.
 6. `TranscriptNormalizer` applies vocabulary-aware normalization and protects configured terms.
-7. `RewriteService` lightly polishes text for the detected app context unless the active profile bypasses rewrite.
+7. `RewriteService` lightly polishes text for the detected app context unless the active profile bypasses rewrite, and multi-line contexts can include a small recent-context window without changing the insertion scope.
 8. `TextInsertionService` inserts the result into the focused macOS app.
 
 ## Permissions
@@ -83,6 +84,8 @@ For live providers, configure:
 
 `OpenAI` defaults to `https://api.openai.com`, `gpt-4o-transcribe`, and `gpt-5-mini`.
 
+The realtime adapter also keeps a short uncommitted audio buffer so transient websocket failures can reconnect and resume with bounded backoff instead of immediately failing the dictation session. Reconnect progress is surfaced in the HUD, menu bar status text, and Debug panel so recovery is visible while the socket is retrying.
+
 ## Privacy
 
 - Settings, vocabulary, and optional history are stored locally.
@@ -128,11 +131,12 @@ xcodebuild -project NoTyping.xcodeproj -scheme NoTyping -destination 'platform=m
 - The app prefers reliability over aggressive rewriting. Protected-term validation and raw fallback are intentionally conservative.
 - Accessibility insertion is the first-class path, but the fallback chain accepts that some apps require typing or pasteboard simulation.
 - The realtime adapter is built around OpenAI-compatible event names and payloads, with capability flags and a mock profile to keep the app usable while provider details vary.
+- Realtime recovery is intentionally bounded. The adapter retries a few times with backoff and replays only the current uncommitted buffer instead of attempting full historical session reconstruction.
 - Launch-at-login uses the main-app registration path for a lightweight setup. A production release may still want additional packaging and signing validation.
 
 ## Remaining TODOs
 
-- Add production-grade reconnect backoff and websocket session resumption.
+- Broaden reconnect recovery beyond the current bounded retry and uncommitted-buffer replay strategy.
 - Expand app-specific rule editing beyond the current practical list view.
 - Add richer token protection for code snippets, shell commands, and URLs during rewrite validation.
 - Add signed distribution, notarization, and release packaging automation.
