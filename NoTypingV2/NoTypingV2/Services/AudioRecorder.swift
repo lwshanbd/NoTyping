@@ -79,12 +79,18 @@ final class AudioRecorder: @unchecked Sendable {
         guard let convertedBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: frameCapacity) else { return }
 
         var error: NSError?
-        var hasData = true
+        // Use a class box to avoid capturing a mutable local in a @Sendable closure.
+        final class InputState: @unchecked Sendable {
+            var hasData = true
+            let buffer: AVAudioPCMBuffer
+            init(buffer: AVAudioPCMBuffer) { self.buffer = buffer }
+        }
+        let inputState = InputState(buffer: inputBuffer)
         let inputBlock: AVAudioConverterInputBlock = { _, outStatus in
-            if hasData {
-                hasData = false
+            if inputState.hasData {
+                inputState.hasData = false
                 outStatus.pointee = .haveData
-                return inputBuffer
+                return inputState.buffer
             }
             outStatus.pointee = .noDataNow
             return nil
