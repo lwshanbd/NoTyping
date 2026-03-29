@@ -1,173 +1,222 @@
-import Carbon
-import ApplicationServices
 import AppKit
+import ApplicationServices
+import Carbon
 import Foundation
 
-enum InsertionStrategyPlanner {
-    static func preferredAccessibilityStrategies(for context: FocusedElementContext) -> [InsertionStrategy] {
-        guard context.isEditable, context.isSecureTextField == false else { return [] }
+struct TextInsertionService {
+    /// Terminal apps have limited AX support; skip AX strategies and go straight
+    /// to keyboard typing / pasteboard fallback.
+    private static let terminalBundleIDs: Set<String> = [
+        "com.apple.Terminal",
+        "com.googlecode.iterm2",
+        "net.kovidgoyal.kitty",
+        "com.github.wez.wezterm",
+    ]
+    func insert(text: String, targetBundleID: String? = nil) throws {
+        let isTerminal = targetBundleID.map { Self.terminalBundleIDs.contains($0) } ?? false
 
-        if context.operation == .replaceSelection {
-            return [.accessibilitySelectionReplacement, .accessibilityValueReplacement]
-        }
+        if !isTerminal {
+            // Strategy 1: AX selected text replacement
+            if let outcome = tryAccessibilitySelectionReplacement(text: text) {
+                _ = outcome
+                return
+            }
 
-        if context.value != nil {
-            return [.accessibilityValueReplacement]
-        }
-
-        return []
-    }
-}
-
-@MainActor
-protocol TextInsertionServiceProtocol: AnyObject {
-    func insert(text: String, context: FocusedElementContext, focusedElement: AXUIElement?) throws -> InsertionOutcome
-}
-
-@MainActor
-final class TextInsertionService: TextInsertionServiceProtocol {
-    private let diagnosticStore: DiagnosticStore
-
-    init(diagnosticStore: DiagnosticStore) {
-        self.diagnosticStore = diagnosticStore
-    }
-
-    func insert(text: String, context: FocusedElementContext, focusedElement: AXUIElement?) throws -> InsertionOutcome {
-        guard context.isSecureTextField == false else {
-            throw DictationError.insertion("Secure text fields are intentionally excluded.")
-        }
-
-        if let focusedElement {
-            for strategy in InsertionStrategyPlanner.preferredAccessibilityStrategies(for: context) {
-                let outcome: InsertionOutcome?
-                switch strategy {
-                case .accessibilitySelectionReplacement:
-                    outcome = try attemptAccessibilitySelectionReplacement(text: text, context: context, focusedElement: focusedElement)
-                case .accessibilityValueReplacement:
-                    outcome = try attemptAccessibilityValueReplacement(text: text, context: context, focusedElement: focusedElement)
-                case .unicodeTyping, .pasteboard:
-                    outcome = nil
-                }
-
-                if let outcome {
-                    return outcome
-                }
+            // Strategy 2: AX value replacement
+            if let outcome = tryAccessibilityValueReplacement(text: text) {
+                _ = outcome
+                return
             }
         }
 
-        if let outcome = try attemptUnicodeTyping(text: text) {
-            return outcome
+        // Strategy 3: CGEvent keyboard typing (only for short text)
+        if text.count < 100 {
+            if tryUnicodeKeyboardTyping(text: text) {
+                return
+            }
         }
 
-        if let outcome = try attemptPasteboardFallback(text: text) {
-            return outcome
+        // Strategy 4: Paste fallback with clipboard protection
+        if tryPasteFallback(text: text) {
+            return
         }
 
-        throw DictationError.insertion("All insertion strategies failed for the focused app.")
+        throw PipelineError.insertionFailed("All insertion strategies failed.")
     }
 
-    private func attemptAccessibilitySelectionReplacement(
-        text: String,
-        context: FocusedElementContext,
-        focusedElement: AXUIElement
-    ) throws -> InsertionOutcome? {
-        guard context.operation == .replaceSelection else { return nil }
-        guard isAttributeSettable(kAXSelectedTextAttribute as CFString, on: focusedElement) else {
-            diagnosticStore.record(subsystem: "insertion", message: "AX selected text replacement unavailable for focused element")
+    // MARK: - Strategy 1: AX Selected Text Replacement
+
+    private func tryAccessibilitySelectionReplacement(text: String) -> Bool? {
+        let systemWide = AXUIElementCreateSystemWide()
+
+        // Get focused application
+        var focusedAppRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(systemWide, kAXFocusedApplicationAttribute as CFString, &focusedAppRef) == .success,
+              let focusedAppRef, CFGetTypeID(focusedAppRef) == AXUIElementGetTypeID()
+        else { return nil }
+
+        let appElement = focusedAppRef as! AXUIElement
+
+        // Get focused UI element
+        var focusedElementRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(appElement, kAXFocusedUIElementAttribute as CFString, &focusedElementRef) == .success,
+              let focusedElementRef, CFGetTypeID(focusedElementRef) == AXUIElementGetTypeID()
+        else { return nil }
+
+        let element = focusedElementRef as! AXUIElement
+
+        // Check role is not secure text field
+        let role = copyStringAttribute(kAXRoleAttribute, from: element)
+        let subrole = copyStringAttribute(kAXSubroleAttribute, from: element)
+        if role == (kAXTextFieldRole as String) && subrole == NSAccessibility.Subrole.secureTextField.rawValue {
             return nil
         }
 
-        let status = AXUIElementSetAttributeValue(focusedElement, kAXSelectedTextAttribute as CFString, text as CFTypeRef)
-        guard status == .success else {
-            diagnosticStore.record(subsystem: "insertion", message: "AX selected text replacement failed with status \(status.rawValue)")
+        // Check if we can get selected text range (confirms cursor position exists)
+        var rangeRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &rangeRef) == .success else {
             return nil
         }
 
-        return InsertionOutcome(strategy: .accessibilitySelectionReplacement, insertedText: text)
+        // Try setting selected text
+        let status = AXUIElementSetAttributeValue(element, kAXSelectedTextAttribute as CFString, text as CFTypeRef)
+        guard status == .success else { return nil }
+
+        return true
     }
 
-    private func attemptAccessibilityValueReplacement(
-        text: String,
-        context: FocusedElementContext,
-        focusedElement: AXUIElement
-    ) throws -> InsertionOutcome? {
-        guard let value = context.value else { return nil }
-        let selection = context.selectedRange ?? NSRange(location: value.utf16.count, length: 0)
-        guard let stringRange = Range(selection, in: value) else { return nil }
+    // MARK: - Strategy 2: AX Value Replacement
 
-        var updated = value
-        updated.replaceSubrange(stringRange, with: text)
+    private func tryAccessibilityValueReplacement(text: String) -> Bool? {
+        let systemWide = AXUIElementCreateSystemWide()
 
-        let status = AXUIElementSetAttributeValue(focusedElement, kAXValueAttribute as CFString, updated as CFTypeRef)
-        guard status == .success else {
-            diagnosticStore.record(subsystem: "insertion", message: "AX value replacement failed with status \(status.rawValue)")
-            return nil
+        var focusedAppRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(systemWide, kAXFocusedApplicationAttribute as CFString, &focusedAppRef) == .success,
+              let focusedAppRef, CFGetTypeID(focusedAppRef) == AXUIElementGetTypeID()
+        else { return nil }
+
+        let appElement = focusedAppRef as! AXUIElement
+
+        var focusedElementRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(appElement, kAXFocusedUIElementAttribute as CFString, &focusedElementRef) == .success,
+              let focusedElementRef, CFGetTypeID(focusedElementRef) == AXUIElementGetTypeID()
+        else { return nil }
+
+        let element = focusedElementRef as! AXUIElement
+
+        // Get current value
+        guard let currentValue = copyStringAttribute(kAXValueAttribute, from: element) else { return nil }
+
+        // Get selected text range to find cursor position
+        var rangeRef: CFTypeRef?
+        let cursorLocation: Int
+        if AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &rangeRef) == .success,
+           let rangeRef, CFGetTypeID(rangeRef) == AXValueGetTypeID() {
+            let axValue = rangeRef as! AXValue
+            var cfRange = CFRange()
+            AXValueGetValue(axValue, .cfRange, &cfRange)
+            cursorLocation = cfRange.location
+        } else {
+            // Default: append at end
+            cursorLocation = currentValue.utf16.count
         }
 
-        let caretLocation = selection.location + text.utf16.count
-        var range = CFRange(location: caretLocation, length: 0)
+        // Compute new value by inserting text at cursor position
+        let utf16 = Array(currentValue.utf16)
+        let clampedLocation = min(cursorLocation, utf16.count)
+        let prefix = String(utf16[..<clampedLocation].map { Character(UnicodeScalar($0)!) })
+        let suffix = String(utf16[clampedLocation...].map { Character(UnicodeScalar($0)!) })
+        let newValue = prefix + text + suffix
+
+        // Set the new value
+        let status = AXUIElementSetAttributeValue(element, kAXValueAttribute as CFString, newValue as CFTypeRef)
+        guard status == .success else { return nil }
+
+        // Move caret to after inserted text
+        let newCaretLocation = clampedLocation + text.utf16.count
+        var range = CFRange(location: newCaretLocation, length: 0)
         if let axRange = AXValueCreate(.cfRange, &range) {
-            AXUIElementSetAttributeValue(focusedElement, kAXSelectedTextRangeAttribute as CFString, axRange)
+            AXUIElementSetAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, axRange)
         }
 
-        return InsertionOutcome(strategy: .accessibilityValueReplacement, insertedText: text)
+        return true
     }
 
-    private func isAttributeSettable(_ attribute: CFString, on element: AXUIElement) -> Bool {
-        var settable: DarwinBoolean = false
-        let status = AXUIElementIsAttributeSettable(element, attribute, &settable)
-        return status == .success && settable.boolValue
-    }
+    // MARK: - Strategy 3: CGEvent Unicode Typing
 
-    private func attemptUnicodeTyping(text: String) throws -> InsertionOutcome? {
-        guard let source = CGEventSource(stateID: .hidSystemState) else { return nil }
-        let characters = Array(text.utf16)
+    private func tryUnicodeKeyboardTyping(text: String) -> Bool {
+        guard let source = CGEventSource(stateID: .hidSystemState) else { return false }
+
+        let utf16Chars = Array(text.utf16)
         guard let down = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true),
               let up = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false)
-        else {
-            return nil
-        }
-        down.keyboardSetUnicodeString(stringLength: characters.count, unicodeString: characters)
-        up.keyboardSetUnicodeString(stringLength: characters.count, unicodeString: characters)
+        else { return false }
+
+        down.keyboardSetUnicodeString(stringLength: utf16Chars.count, unicodeString: utf16Chars)
+        up.keyboardSetUnicodeString(stringLength: utf16Chars.count, unicodeString: utf16Chars)
         down.post(tap: .cghidEventTap)
         up.post(tap: .cghidEventTap)
-        return InsertionOutcome(strategy: .unicodeTyping, insertedText: text)
+
+        return true
     }
 
-    private func attemptPasteboardFallback(text: String) throws -> InsertionOutcome? {
-        let pasteboard = NSPasteboard.general
-        let previousChangeCount = pasteboard.changeCount
-        let previousItems = pasteboard.pasteboardItems
+    // MARK: - Strategy 4: Paste Fallback
 
+    private func tryPasteFallback(text: String) -> Bool {
+        let pasteboard = NSPasteboard.general
+        let savedChangeCount = pasteboard.changeCount
+
+        // Save current pasteboard items
+        let savedItems = pasteboard.pasteboardItems?.compactMap { item -> [(NSPasteboard.PasteboardType, Data)]? in
+            let pairs = item.types.compactMap { type -> (NSPasteboard.PasteboardType, Data)? in
+                guard let data = item.data(forType: type) else { return nil }
+                return (type, data)
+            }
+            return pairs.isEmpty ? nil : pairs
+        }
+
+        // Set pasteboard to our text
         pasteboard.clearContents()
         pasteboard.setString(text, forType: .string)
 
+        // Simulate Cmd+V
         guard let source = CGEventSource(stateID: .hidSystemState),
               let vDown = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(kVK_ANSI_V), keyDown: true),
               let vUp = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(kVK_ANSI_V), keyDown: false)
-        else {
-            return nil
-        }
+        else { return false }
 
-        vDown.flags = CGEventFlags.maskCommand
-        vUp.flags = CGEventFlags.maskCommand
-        vDown.post(tap: CGEventTapLocation.cghidEventTap)
-        vUp.post(tap: CGEventTapLocation.cghidEventTap)
+        vDown.flags = .maskCommand
+        vUp.flags = .maskCommand
+        vDown.post(tap: .cghidEventTap)
+        vUp.post(tap: .cghidEventTap)
 
-        Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(350))
-            if pasteboard.changeCount == previousChangeCount + 1 {
+        // Restore pasteboard after a delay
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+            // Only restore if the pasteboard hasn't been modified externally
+            if pasteboard.changeCount == savedChangeCount + 1 {
                 pasteboard.clearContents()
-                previousItems?.forEach { item in
-                    for type in item.types {
-                        if let value = item.data(forType: type) {
-                            pasteboard.setData(value, forType: type)
+                if let savedItems {
+                    for itemPairs in savedItems {
+                        let newItem = NSPasteboardItem()
+                        for (type, data) in itemPairs {
+                            newItem.setData(data, forType: type)
                         }
+                        pasteboard.writeObjects([newItem])
                     }
                 }
             }
         }
 
-        return InsertionOutcome(strategy: .pasteboard, insertedText: text)
+        return true
+    }
+
+    // MARK: - Helpers
+
+    private func copyStringAttribute(_ attribute: String, from element: AXUIElement) -> String? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success,
+              let value
+        else { return nil }
+        return value as? String
     }
 }

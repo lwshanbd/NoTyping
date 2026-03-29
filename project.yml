@@ -14,7 +14,6 @@ settings:
     AD_HOC_CODE_SIGNING_ALLOWED: NO
     GENERATE_INFOPLIST_FILE: YES
     INFOPLIST_KEY_CFBundleDisplayName: NoTyping
-    INFOPLIST_KEY_LSUIElement: YES
     INFOPLIST_KEY_NSMicrophoneUsageDescription: NoTyping needs microphone access to capture dictation audio for system-wide voice typing.
 targets:
   NoTyping:

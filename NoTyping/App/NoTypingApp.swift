@@ -7,8 +7,11 @@ struct NoTypingApp: App {
     var body: some Scene {
         Settings {
             SettingsRootView()
-                .environmentObject(appDelegate.coordinator)
-                .frame(minWidth: 880, minHeight: 640)
+                .environmentObject(appDelegate.coordinator.settingsStore)
+                .environmentObject(appDelegate.coordinator.vocabularyStore)
+                .environmentObject(appDelegate.coordinator.historyStore)
+                .environmentObject(appDelegate.coordinator.permissionManager)
+                .frame(minWidth: 600, minHeight: 400)
         }
     }
 }
