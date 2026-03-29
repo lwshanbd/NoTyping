@@ -21,6 +21,7 @@ final class HotkeyManager {
         installHandler()
 
         let hotKeyID = EventHotKeyID(signature: Self.signature, id: 1)
+        print("[HotkeyManager] Registering hotkey: keyCode=\(hotkey.keyCode) modifiers=\(hotkey.carbonModifiers) display=\(hotkey.displayString)")
         let status = RegisterEventHotKey(
             hotkey.keyCode,
             hotkey.carbonModifiers,
@@ -30,12 +31,14 @@ final class HotkeyManager {
             &hotKeyRef
         )
         guard status == noErr else {
+            print("[HotkeyManager] RegisterEventHotKey FAILED with status \(status)")
             throw NSError(
                 domain: NSOSStatusErrorDomain,
                 code: Int(status),
                 userInfo: [NSLocalizedDescriptionKey: "RegisterEventHotKey failed with status \(status)"]
             )
         }
+        print("[HotkeyManager] Hotkey registered successfully")
     }
 
     func unregister() {
@@ -67,8 +70,10 @@ final class HotkeyManager {
                 let kind = GetEventKind(event)
                 MainActor.assumeIsolated {
                     if kind == UInt32(kEventHotKeyPressed) {
+                        print("[HotkeyManager] Carbon event: hotkey PRESSED")
                         manager.delegate?.hotkeyPressed()
                     } else if kind == UInt32(kEventHotKeyReleased) {
+                        print("[HotkeyManager] Carbon event: hotkey RELEASED")
                         manager.delegate?.hotkeyReleased()
                     }
                 }

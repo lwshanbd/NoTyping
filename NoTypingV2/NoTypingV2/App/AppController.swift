@@ -25,6 +25,8 @@ final class AppController: NSObject, ObservableObject, HotkeyManagerDelegate {
         super.init()
     }
 
+    private var settingsCancellable: AnyCancellable?
+
     // MARK: - Lifecycle
 
     func start() {
@@ -47,24 +49,42 @@ final class AppController: NSObject, ObservableObject, HotkeyManagerDelegate {
         }
 
         // 4. Register hotkey
-        do {
-            try hotkeyManager.register(hotkey: settingsStore.settings.hotkey)
-        } catch {
-            print("[AppController] Failed to register hotkey: \(error.localizedDescription)")
-        }
+        registerHotkey()
 
         // 5. Set delegate
         hotkeyManager.delegate = self
 
         // 6. Build and start the pipeline
         rebuildPipeline()
+
+        // 7. Watch for settings changes to re-register hotkey and rebuild pipeline
+        settingsCancellable = settingsStore.$settings
+            .removeDuplicates()
+            .dropFirst() // skip initial value
+            .debounce(for: .milliseconds(300), scheduler: RunLoop.main)
+            .sink { [weak self] _ in
+                guard let self else { return }
+                self.registerHotkey()
+                self.rebuildPipeline()
+            }
     }
 
     func stop() {
+        settingsCancellable?.cancel()
+        settingsCancellable = nil
         eventTask?.cancel()
         eventTask = nil
         hotkeyManager.unregister()
         pipeline = nil
+    }
+
+    private func registerHotkey() {
+        do {
+            try hotkeyManager.register(hotkey: settingsStore.settings.hotkey)
+            print("[AppController] Hotkey registered: \(settingsStore.settings.hotkey.displayString)")
+        } catch {
+            print("[AppController] Failed to register hotkey: \(error.localizedDescription)")
+        }
     }
 
     // MARK: - Pipeline Construction
@@ -191,13 +211,20 @@ final class AppController: NSObject, ObservableObject, HotkeyManagerDelegate {
     // MARK: - HotkeyManagerDelegate
 
     func hotkeyPressed() {
-        guard let pipeline else { return }
-        switch settingsStore.settings.hotkeyMode {
-        case .toggle:
-            Task { await pipeline.toggleRecording() }
-        case .pushToTalk:
-            Task { await pipeline.hotkeyPressed() }
+        print("[AppController] hotkeyPressed (mode: \(settingsStore.settings.hotkeyMode))")
+        guard let pipeline else {
+            print("[AppController] Pipeline is nil, rebuilding...")
+            rebuildPipeline()
+            // Try again after rebuild
+            guard let pipeline = self.pipeline else {
+                hudController.show(state: "⚠", detail: "请先配置 API Key", isError: true)
+                hudController.hide(after: 2.0)
+                return
+            }
+            Task { await triggerPipeline(pipeline, pressed: true) }
+            return
         }
+        Task { await triggerPipeline(pipeline, pressed: true) }
     }
 
     func hotkeyReleased() {
@@ -206,7 +233,18 @@ final class AppController: NSObject, ObservableObject, HotkeyManagerDelegate {
         case .pushToTalk:
             Task { await pipeline.hotkeyReleased() }
         case .toggle:
-            break // No action on release in toggle mode
+            break
+        }
+    }
+
+    private func triggerPipeline(_ pipeline: DictationPipeline, pressed: Bool) async {
+        if pressed {
+            switch settingsStore.settings.hotkeyMode {
+            case .toggle:
+                await pipeline.toggleRecording()
+            case .pushToTalk:
+                await pipeline.hotkeyPressed()
+            }
         }
     }
 
