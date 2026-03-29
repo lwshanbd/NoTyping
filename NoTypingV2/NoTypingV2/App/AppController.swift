@@ -1,4 +1,5 @@
 import AppKit
+import ApplicationServices
 import Combine
 import SwiftUI
 
@@ -39,8 +40,12 @@ final class AppController: NSObject, ObservableObject, HotkeyManagerDelegate {
         }
         menuBarController.setup()
 
-        // 2. Check permissions
+        // 2. Check permissions and prompt if needed
         permissionManager.refresh()
+        permissionManager.promptAccessibilityIfNeeded()
+        if permissionManager.microphoneStatus == .undetermined {
+            Task { await permissionManager.requestMicrophonePermission() }
+        }
 
         // 3. If no API key configured, show settings on API tab
         let sttKey = settingsStore.loadAPIKey(for: settingsStore.settings.sttConfig.apiKeyAccount)
@@ -212,10 +217,19 @@ final class AppController: NSObject, ObservableObject, HotkeyManagerDelegate {
 
     func hotkeyPressed() {
         print("[AppController] hotkeyPressed (mode: \(settingsStore.settings.hotkeyMode))")
+
+        // Check accessibility permission first
+        if !AXIsProcessTrusted() {
+            print("[AppController] Accessibility NOT granted, prompting user")
+            hudController.show(state: "⚠", detail: "需要辅助功能权限才能输入文字", isError: true)
+            hudController.hide(after: 3.0)
+            permissionManager.requestAccessibilityPermission()
+            return
+        }
+
         guard let pipeline else {
             print("[AppController] Pipeline is nil, rebuilding...")
             rebuildPipeline()
-            // Try again after rebuild
             guard let pipeline = self.pipeline else {
                 hudController.show(state: "⚠", detail: "请先配置 API Key", isError: true)
                 hudController.hide(after: 2.0)

@@ -1,9 +1,11 @@
+import ApplicationServices
 import AVFoundation
 import Carbon
 import SwiftUI
 
 struct GeneralSettingsView: View {
     @EnvironmentObject private var settingsStore: SettingsStore
+    @EnvironmentObject private var permissionManager: PermissionManager
 
     @State private var audioDevices: [AudioDeviceInfo] = []
     @State private var selectedDeviceUID: String = ""
@@ -11,6 +13,40 @@ struct GeneralSettingsView: View {
 
     var body: some View {
         Form {
+            Section("Permissions") {
+                HStack {
+                    Text("Accessibility")
+                    Spacer()
+                    if permissionManager.accessibilityStatus == .granted {
+                        Label("Granted", systemImage: "checkmark.circle.fill")
+                            .foregroundStyle(.green)
+                    } else {
+                        Button("Grant Access") {
+                            permissionManager.requestAccessibilityPermission()
+                        }
+                        .foregroundStyle(.red)
+                    }
+                }
+                if permissionManager.accessibilityStatus != .granted {
+                    Text("NoTyping needs accessibility permission to type text into other apps. Without it, text can only be copied to clipboard.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                HStack {
+                    Text("Microphone")
+                    Spacer()
+                    if permissionManager.microphoneStatus == .granted {
+                        Label("Granted", systemImage: "checkmark.circle.fill")
+                            .foregroundStyle(.green)
+                    } else {
+                        Button("Grant Access") {
+                            Task { await permissionManager.requestMicrophonePermission() }
+                        }
+                        .foregroundStyle(.red)
+                    }
+                }
+            }
+
             Section("Hotkey") {
                 HStack {
                     Text("Shortcut")

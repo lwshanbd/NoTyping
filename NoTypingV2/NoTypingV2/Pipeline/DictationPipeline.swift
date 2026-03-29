@@ -183,18 +183,19 @@ actor DictationPipeline {
             // Step 4: Insert text
             transition(to: .inserting)
 
-            // Check if focus target is still valid
+            // Try to detect if focus is still valid
             let currentSnapshot = await captureCurrentFocus()
             let focusStillValid = isFocusValid(saved: savedFocusSnapshot, current: currentSnapshot)
+            let accessibilityUnavailable = (savedFocusSnapshot?.pid == nil && currentSnapshot.pid == nil)
 
-            if !focusStillValid {
-                // Focus lost: show result panel instead
+            // If we can detect focus and it's changed, show result panel
+            if !focusStillValid && !accessibilityUnavailable {
                 emit(.focusLost(text: finalText))
                 await saveHistory(rawText: originalText, polishedText: finalText, targetApp: savedFocusSnapshot?.bundleIdentifier, wasInserted: false)
                 return
             }
 
-            // Insert text via main actor
+            // Try to insert text. If accessibility is unavailable, still try (paste fallback may work).
             let insertionSvc = insertionService
             let insertionError: PipelineError? = await MainActor.run {
                 do {
@@ -208,8 +209,13 @@ actor DictationPipeline {
             }
 
             if let insertionError {
-                emit(.error(insertionError))
-                // Still save to history even if insertion failed
+                if accessibilityUnavailable {
+                    // Accessibility not granted. Show result panel + hint.
+                    print("[Pipeline] Insertion failed (likely no accessibility permission): \(insertionError)")
+                    emit(.focusLost(text: finalText))
+                } else {
+                    emit(.error(insertionError))
+                }
                 await saveHistory(rawText: originalText, polishedText: finalText, targetApp: savedFocusSnapshot?.bundleIdentifier, wasInserted: false)
                 return
             }

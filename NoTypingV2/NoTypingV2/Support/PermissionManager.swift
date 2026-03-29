@@ -4,6 +4,16 @@ import AVFoundation
 import AVFAudio
 import Foundation
 
+// Workaround for Swift 6 strict concurrency: access the C global outside strict checking
+private func makeAccessibilityPromptOptions() -> CFDictionary {
+    // kAXTrustedCheckOptionPrompt is a global C var; we access it in a non-isolated function
+    let key = unsafeBitCast(
+        dlsym(dlopen(nil, RTLD_LAZY), "kAXTrustedCheckOptionPrompt"),
+        to: UnsafePointer<Unmanaged<CFString>>.self
+    ).pointee.takeUnretainedValue()
+    return [key: true] as CFDictionary
+}
+
 @MainActor
 final class PermissionManager: ObservableObject {
     enum Status: String { case granted, denied, undetermined }
@@ -47,10 +57,20 @@ final class PermissionManager: ObservableObject {
             refresh()
             return
         }
-        // Open System Settings to the Accessibility privacy pane
+        // Trigger the system prompt to add this app to Accessibility
+        let options = makeAccessibilityPromptOptions()
+        _ = AXIsProcessTrustedWithOptions(options)
+        // Also open System Settings as a backup (the system prompt sometimes doesn't appear for non-sandboxed apps)
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
             NSWorkspace.shared.open(url)
         }
         refresh()
+    }
+
+    /// Trigger the system accessibility prompt without opening System Settings.
+    func promptAccessibilityIfNeeded() {
+        guard !AXIsProcessTrusted() else { return }
+        let options = makeAccessibilityPromptOptions()
+        _ = AXIsProcessTrustedWithOptions(options)
     }
 }
